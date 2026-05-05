@@ -19,17 +19,26 @@ resource "kubernetes_namespace" "dc_system" {
   metadata {
     name = "dc-system"
   }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
 }
 
 resource "kubernetes_namespace" "arc_systems" {
   metadata {
     name = "arc-systems"
   }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
 }
 
 resource "kubernetes_namespace" "arc_runners" {
   metadata {
     name = "arc-runners"
+  }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
   }
 }
 
@@ -242,6 +251,10 @@ resource "kubernetes_deployment" "dc_api" {
     }
   }
 
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
+
   spec {
     replicas = 1
 
@@ -369,6 +382,9 @@ resource "kubernetes_service" "ingress_lb" {
     name      = "ingress-expose"
     namespace = "kube-system"
   }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
   spec {
     type = "LoadBalancer"
     selector = {
@@ -396,6 +412,9 @@ resource "kubernetes_ingress_v1" "dc_api" {
       "nginx.ingress.kubernetes.io/proxy-read-timeout" = "3600"
       "nginx.ingress.kubernetes.io/proxy-send-timeout" = "3600"
     }
+  }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
   }
   spec {
     ingress_class_name = "nginx"
