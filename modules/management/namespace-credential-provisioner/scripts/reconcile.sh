@@ -383,11 +383,19 @@ on_added_cluster() {
   fi
 
   # Only provision if we manage this namespace (SA token exists on Harvester).
+  # The namespace watch may still be initialising the SA when the cluster event
+  # arrives — poll for up to 90s before giving up.
   local sa_name="harvester-cloud-provider-${vm_namespace}"
-  if ! kubectl get secret "${sa_name}-token" -n "$vm_namespace" &>/dev/null; then
-    log "  [cluster] namespace ${vm_namespace} not managed by this reconciler — skipping"
-    return
-  fi
+  local waited=0
+  while ! kubectl get secret "${sa_name}-token" -n "$vm_namespace" &>/dev/null; do
+    if [[ $waited -ge 90 ]]; then
+      log "  [cluster] namespace ${vm_namespace} not managed by this reconciler — skipping"
+      return 0
+    fi
+    log "  [cluster] waiting for SA token in ${vm_namespace} (${waited}s)..."
+    sleep 5
+    waited=$((waited + 5))
+  done
 
   log "  [cluster] provisioning ${secret_name} for cluster ${cluster_name} (namespace: ${vm_namespace})"
   write_harvesterconfig "$secret_name" "$cluster_name" "$vm_namespace" \
@@ -440,6 +448,7 @@ namespace_watch_loop() {
 
         is_system_namespace "$ns" && continue
         [[ "$role" == "network-namespace" ]] && continue
+        [[ "$role" == "infrastructure" ]] && continue
 
         if [[ -n "$deletion_ts" ]]; then
           if grep -qxF "$ns" "$PROCESSED_NS_FILE" 2>/dev/null; then
@@ -540,6 +549,7 @@ kubectl get namespaces -o json | jq -r '
   [[ -z "$project_id" ]] && continue
   is_system_namespace "$ns" && continue
   [[ "$role" == "network-namespace" ]] && continue
+  [[ "$role" == "infrastructure" ]] && continue
   sa_name="harvester-cloud-provider-${ns}"
   if kubectl get secret "${sa_name}-token" -n "$ns" &>/dev/null; then
     # Cloud-provider credentials already exist. Check for the VM-access kubeconfig
