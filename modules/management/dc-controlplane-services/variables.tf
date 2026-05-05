@@ -67,6 +67,10 @@ variable "log_level" {
   type        = string
   description = "DC-API log level (debug | info | warn | error)."
   default     = "info"
+  validation {
+    condition     = contains(["debug", "info", "warn", "error"], var.log_level)
+    error_message = "log_level must be one of: debug, info, warn, error."
+  }
 }
 
 variable "operator_ssh_key" {

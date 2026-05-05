@@ -438,7 +438,7 @@ resource "kubernetes_role_v1" "dc_api_deployer" {
 
   rule {
     api_groups = [""]
-    resources  = ["namespaces", "services", "configmaps", "persistentvolumeclaims"]
+    resources  = ["services", "configmaps", "persistentvolumeclaims"]
     verbs      = ["get", "list", "create", "update", "patch"]
   }
   rule {
