@@ -16,3 +16,8 @@ output "vm_id" {
   value       = harvester_virtualmachine.rancher_server[0].id
   description = "Harvester resource ID of the Rancher server VM (namespace/name)"
 }
+
+output "vm_image_id" {
+  value       = var.image_url != "" ? "${harvester_image.vm_image[0].namespace}/${harvester_image.vm_image[0].name}" : var.ubuntu_image_id
+  description = "Harvester image reference (namespace/name) for the OS image downloaded by this module. Re-use in downstream layers to avoid downloading the same image twice."
+}
