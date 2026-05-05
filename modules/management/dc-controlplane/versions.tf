@@ -9,5 +9,9 @@ terraform {
       source  = "harvester/harvester"
       version = "~> 1.7"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
   }
 }

@@ -105,3 +105,40 @@ module "cluster" {
     harvester_ippool.lb,
   ]
 }
+
+# ── IPPool scope patch (workaround) ──────────────────────────────────────────
+# The IPPool is created without selector.scope. Without it, Harvester's LB
+# controller times out with "no matched IPPool with requirement
+# {Project:..., Namespace:<ns>, Cluster:kubernetes}".
+#
+# Format note: rancher2 outputs project_id as "cluster:project" (colon) but
+# Harvester's LB matcher expects "cluster/project" (slash). Without the
+# conversion below the patch is silently dropped by admission and only the
+# namespace field survives, leaving the LB unable to match the pool.
+#
+# TODO: replace with a declarative harvester_ippool attribute once the
+# Harvester provider exposes selector.scope.
+locals {
+  dcapi_project_id_slash = replace(module.project.project_id, ":", "/")
+}
+
+resource "null_resource" "ippool_scope_patch" {
+  triggers = {
+    cluster_id = module.cluster.cluster_id
+    project_id = local.dcapi_project_id_slash
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubectl --kubeconfig "${var.harvester_kubeconfig_path}" \
+        patch ippool.loadbalancer.harvesterhci.io "${var.cluster_name}-lb" \
+        --type=merge \
+        -p '{"spec":{"selector":{"scope":[{"namespace":"${var.project_name}","project":"${local.dcapi_project_id_slash}"}]}}}'
+    EOT
+  }
+
+  depends_on = [
+    module.cluster,
+    harvester_ippool.lb,
+  ]
+}

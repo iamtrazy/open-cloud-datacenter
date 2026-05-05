@@ -89,3 +89,8 @@ variable "machine_global_config" {
   description = "Full machine_global_config YAML for the cluster. Defaults to a config with extended kube-apiserver etcd healthcheck timeout and extended kube-controller-manager / kube-scheduler leader-election timeouts, to tolerate higher disk I/O latency on Harvester/Longhorn-backed storage."
   default     = null
 }
+
+variable "harvester_kubeconfig_path" {
+  type        = string
+  description = "Path to the Harvester kubeconfig file. Used to run the kubectl patch that sets the IPPool selector.scope after cluster creation."
+}
