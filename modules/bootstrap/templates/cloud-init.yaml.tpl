@@ -12,6 +12,18 @@ packages:
   - qemu-guest-agent
   - curl
   - iptables
+%{~ if tls_source == "secret" }
+
+write_files:
+  - path: /tmp/rancher-tls.crt
+    permissions: '0600'
+    encoding: b64
+    content: ${tls_cert_b64}
+  - path: /tmp/rancher-tls.key
+    permissions: '0600'
+    encoding: b64
+    content: ${tls_key_b64}
+%{~ endif }
 
 runcmd:
   - systemctl enable --now qemu-guest-agent
@@ -98,7 +110,18 @@ runcmd:
         # 7. Cert-Manager
         /usr/local/bin/kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.yaml
         /usr/local/bin/kubectl wait --for=condition=Available --timeout=600s deployment/cert-manager-webhook -n cert-manager
-        
+%{~ if tls_source == "secret" }
+
+        # 8a. Pre-create TLS secret so Rancher Helm finds it on first install
+        /usr/local/bin/kubectl create namespace cattle-system --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -
+        /usr/local/bin/kubectl create secret tls tls-rancher-ingress \
+          --cert=/tmp/rancher-tls.crt \
+          --key=/tmp/rancher-tls.key \
+          -n cattle-system \
+          --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -
+        rm -f /tmp/rancher-tls.crt /tmp/rancher-tls.key
+%{~ endif }
+
         # 8. Rancher Installation Loop
         i=1; while [ $i -le 10 ]; do
           echo "Rancher install attempt $i..."
@@ -113,6 +136,7 @@ runcmd:
             --set replicas=${node_count} \
             --set global.cattle.psp.enabled=false \
             --set startupProbe.failureThreshold=60 \
+            --set ingress.tls.source=${tls_source} \
             --wait --timeout 15m && break
           i=$((i+1)); sleep 30
         done

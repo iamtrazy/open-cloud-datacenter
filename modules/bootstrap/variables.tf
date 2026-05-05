@@ -291,6 +291,32 @@ variable "storage_network_exclude_ranges" {
   default     = []
 }
 
+# ── TLS certificate ───────────────────────────────────────────────────────────
+variable "tls_source" {
+  type        = string
+  description = "'rancher' (default — cert-manager issues a self-signed CA) or 'secret' (BYO public cert via tls_cert/tls_key). Use 'secret' when the domain has a publicly-trusted certificate so cattle-cluster-agent can verify Rancher without a CoreDNS override."
+  default     = "rancher"
+
+  validation {
+    condition     = contains(["rancher", "secret"], var.tls_source)
+    error_message = "tls_source must be 'rancher' or 'secret'."
+  }
+}
+
+variable "tls_cert" {
+  type        = string
+  description = "PEM-encoded TLS certificate (full chain: leaf + intermediates) for Rancher. Required when tls_source = 'secret'."
+  sensitive   = true
+  default     = ""
+}
+
+variable "tls_key" {
+  type        = string
+  description = "PEM-encoded private key matching tls_cert. Required when tls_source = 'secret'."
+  sensitive   = true
+  default     = ""
+}
+
 # ── RKE2 / Rancher versions ───────────────────────────────────────────────────
 variable "rke2_version" {
   type        = string

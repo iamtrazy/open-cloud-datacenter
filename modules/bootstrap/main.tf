@@ -20,6 +20,24 @@ terraform {
   }
 }
 
+# ── Harvester namespace ───────────────────────────────────────────────────────
+# Creates a dedicated namespace for bootstrap resources when harvester_namespace
+# is not "default". Labelled as infrastructure so the namespace-credential-
+# provisioner skips it (it only provisions credentials for tenant namespaces).
+resource "kubernetes_namespace" "harvester_ns" {
+  count = var.harvester_namespace != "default" ? 1 : 0
+  metadata {
+    name = var.harvester_namespace
+    labels = {
+      "platform.wso2.com/role" = "infrastructure"
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
+}
+
 # ── Cloud image ───────────────────────────────────────────────────────────────
 # Downloads and registers the image when image_url is provided.
 # Set ubuntu_image_id instead to reference a pre-existing image (brownfield).
@@ -32,10 +50,10 @@ resource "harvester_image" "vm_image" {
   backend      = "backingimage"
   url          = var.image_url
 
-  # Must wait for the new default SC to be in place. The annotation removal on
-  # harvester-longhorn and the new SC creation run in parallel; downloading the
-  # image in that window leaves no default SC and the mutating webhook rejects it.
-  depends_on = [kubernetes_storage_class_v1.default]
+  depends_on = [
+    kubernetes_storage_class_v1.default,
+    kubernetes_namespace.harvester_ns,
+  ]
 }
 
 locals {
@@ -62,14 +80,16 @@ resource "harvester_ssh_key" "bootstrap_key" {
   name       = "${var.vm_name}-ssh-key"
   namespace  = var.harvester_namespace
   public_key = tls_private_key.bootstrap_key[0].public_key_openssh
+  depends_on = [kubernetes_namespace.harvester_ns]
 }
 
 # ── Cloud-init secret (greenfield only) ──────────────────────────────────────
 # Set create_cloudinit_secret = false and provide existing_cloudinit_secret_name instead.
 resource "harvester_cloudinit_secret" "cloudinit" {
-  count     = var.create_cloudinit_secret ? var.node_count : 0
-  name      = var.node_count > 1 ? "${var.vm_name}-cloudinit-${count.index}" : "${var.vm_name}-cloudinit"
-  namespace = var.harvester_namespace
+  count      = var.create_cloudinit_secret ? var.node_count : 0
+  name       = var.node_count > 1 ? "${var.vm_name}-cloudinit-${count.index}" : "${var.vm_name}-cloudinit"
+  namespace  = var.harvester_namespace
+  depends_on = [kubernetes_namespace.harvester_ns]
 
   user_data = templatefile("${path.module}/templates/cloud-init.yaml.tpl", {
     password         = var.vm_password
@@ -81,6 +101,9 @@ resource "harvester_cloudinit_secret" "cloudinit" {
     lb_ip            = var.ippool_start
     rke2_version     = var.rke2_version
     rancher_version  = var.rancher_version
+    tls_source       = var.tls_source
+    tls_cert_b64     = var.tls_source == "secret" ? base64encode(var.tls_cert) : ""
+    tls_key_b64      = var.tls_source == "secret" ? base64encode(var.tls_key) : ""
   })
 }
 
