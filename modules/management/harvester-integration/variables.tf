@@ -21,7 +21,7 @@ variable "credential_namespace" {
   description = "Kubernetes namespace for the cloud credential ServiceAccount and token Secret on Harvester. Override to match an existing namespace when importing brownfield state."
   default     = "kube-system"
   validation {
-    condition     = trim(var.credential_namespace) != ""
+    condition     = trimspace(var.credential_namespace) != ""
     error_message = "credential_namespace must be a non-empty Kubernetes namespace."
   }
 }
