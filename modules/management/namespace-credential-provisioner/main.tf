@@ -46,8 +46,20 @@ resource "kubernetes_cluster_role_v1" "provisioner" {
     verbs      = ["get", "create", "patch", "update", "delete", "escalate"]
   }
 
-  # Needed to create RoleBindings that reference ClusterRoles. bind allows
-  # referencing a specific ClusterRole without holding all its permissions.
+  # Manage ClusterRoleBindings cluster-wide. Used to bind tenant cloud-provider
+  # ServiceAccounts to the chart-shipped `harvesterhci.io:csi-driver` ClusterRole
+  # — required for harvester-csi-driver on guest RKE2 clusters to enable RWX
+  # support. ClusterRoleBindings are cluster-scoped (not namespaced) so the
+  # `rolebindings` rule above does not cover them.
+  rule {
+    api_groups = ["rbac.authorization.k8s.io"]
+    resources  = ["clusterrolebindings"]
+    verbs      = ["get", "create", "patch", "update", "delete"]
+  }
+
+  # Needed to create RoleBindings and ClusterRoleBindings that reference
+  # ClusterRoles. bind allows referencing a specific ClusterRole without
+  # holding all its permissions.
   rule {
     api_groups = ["rbac.authorization.k8s.io"]
     resources  = ["clusterroles"]
@@ -70,30 +82,6 @@ resource "kubernetes_cluster_role_binding_v1" "provisioner" {
     kind      = "ServiceAccount"
     name      = kubernetes_service_account_v1.provisioner.metadata[0].name
     namespace = var.namespace
-  }
-}
-
-# ── ClusterRole — RWX support for tenant cloud-provider SAs ───────────────────
-# Bound by the reconciler per-tenant into harvester-system and longhorn-system.
-# Required so harvester-csi-driver running on guest RKE2 clusters can probe
-# NetworkFileSystem / Longhorn Volume resources at startup; without these the
-# driver silently disables RWX support and every RWX CreateVolume returns
-# `access mode MULTI_NODE_MULTI_WRITER is not supported`.
-resource "kubernetes_cluster_role_v1" "cloud_provider_rwx" {
-  metadata {
-    name = "harvester-cloud-provider-rwx"
-  }
-
-  rule {
-    api_groups = ["harvesterhci.io"]
-    resources  = ["networkfilesystems"]
-    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete"]
-  }
-
-  rule {
-    api_groups = ["longhorn.io"]
-    resources  = ["volumes"]
-    verbs      = ["get", "list", "watch"]
   }
 }
 
@@ -213,8 +201,5 @@ resource "kubernetes_deployment_v1" "provisioner" {
     }
   }
 
-  depends_on = [
-    kubernetes_cluster_role_binding_v1.provisioner,
-    kubernetes_cluster_role_v1.cloud_provider_rwx,
-  ]
+  depends_on = [kubernetes_cluster_role_binding_v1.provisioner]
 }

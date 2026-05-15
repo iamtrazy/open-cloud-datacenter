@@ -78,26 +78,39 @@ is_system_namespace() {
   return 1
 }
 
-# Ensure RoleBindings exist that grant the tenant cloud-provider SA access
-# to NetworkFileSystem CRs (harvester-system) and Longhorn Volume status
-# (longhorn-system). Required so harvester-csi-driver on guest RKE2 clusters
-# can enable RWX support at startup. Without these, every RWX CreateVolume
-# returns `access mode MULTI_NODE_MULTI_WRITER is not supported`.
+# Ensure a ClusterRoleBinding exists granting the tenant cloud-provider SA the
+# RBAC that harvester-csi-driver on guest RKE2 clusters needs at runtime:
+# read/list/watch on storageclasses + volumeattachments, read/write on
+# networkfilesystems, and read on longhorn volumes. Bound against the
+# chart-shipped `harvesterhci.io:csi-driver` ClusterRole so we inherit any
+# future Harvester chart updates to that permission set automatically.
 #
-# Idempotent: kubectl apply is a no-op if the RoleBinding already matches.
-# Safe before the SA exists: RoleBinding does not validate subject existence.
+# Mirrors what Rancher UI provisioning and workloads/harvester-cloud-credential
+# create. Without it, harvester-csi-driver's startup probe falls through to
+# "Do no-op for non-LH RWX volume", returns success from ControllerPublish
+# without creating the NetworkFileSystem CR, and every RWX PVC ends up
+# unmountable with `Failed to get NetworkFS ...: not found`. This is the gap
+# that the official `generate_addon.sh` script (which only binds to
+# `harvesterhci.io:cloudprovider`) leaves behind.
+#
+# Short-circuits if the binding already exists — keeps the init pass quiet on
+# already-provisioned tenants and avoids spurious `configured` output from
+# kubectl apply's three-way merge over creationTimestamp normalization. Note
+# this means we do not reconcile drift in the binding's `subjects` field if
+# someone tampers with it out-of-band; the `roleRef` is immutable in any case.
 # Args: ns
-ensure_rwx_bindings() {
+ensure_csi_clusterrolebinding() {
   local ns="$1"
   local sa_name="harvester-cloud-provider-${ns}"
-  local rb_name="${sa_name}-rwx"
+  local crb_name="${sa_name}-csi-driver"
 
-  for target_ns in harvester-system longhorn-system; do
-    kubectl create rolebinding "$rb_name" \
-      --clusterrole=harvester-cloud-provider-rwx \
-      --serviceaccount="${ns}:${sa_name}" \
-      -n "$target_ns" --dry-run=client -o yaml | kubectl apply -f -
-  done
+  if kubectl get clusterrolebinding "$crb_name" &>/dev/null; then
+    return 0
+  fi
+
+  kubectl create clusterrolebinding "$crb_name" \
+    --clusterrole=harvesterhci.io:csi-driver \
+    --serviceaccount="${ns}:${sa_name}"
 }
 
 # Build and write harvesterconfig-<name> to Rancher fleet-default.
@@ -321,10 +334,11 @@ EOF
 
   log "  [ns] SA ready: ${sa_name} in ${ns}"
 
-  # RoleBindings in shared system namespaces so harvester-csi-driver on guest
-  # clusters can enable RWX support. Failure propagates so the namespace stays
-  # unprocessed and the watch loop retries.
-  ensure_rwx_bindings "$ns" || return 1
+  # ClusterRoleBinding so harvester-csi-driver on guest clusters can talk to
+  # storageclasses / networkfilesystems / longhorn volumes — required for RWX.
+  # Failure propagates so the namespace stays unprocessed and the watch loop
+  # retries.
+  ensure_csi_clusterrolebinding "$ns" || return 1
 
   # Consumer VM-access kubeconfig — separate SA with broader permissions.
   # Explicit return propagates failure to the caller so the namespace is NOT
@@ -376,13 +390,11 @@ on_deleted_namespace() {
   kubectl delete rolebinding "${ns}-${vm_sa_name}-public-view" -n "harvester-public" \
     2>/dev/null && log "  [ns] deleted harvester-public RoleBinding for ${vm_sa_name}" || true
 
-  # Delete RWX RoleBindings from harvester-system and longhorn-system. Tolerate
-  # "not found" — they may already be gone or never existed for namespaces
-  # provisioned before this feature was added.
-  for target_ns in harvester-system longhorn-system; do
-    kubectl delete rolebinding "${sa_name}-rwx" -n "$target_ns" 2>/dev/null \
-      && log "  [ns] deleted ${sa_name}-rwx from ${target_ns}" || true
-  done
+  # Delete the per-tenant ClusterRoleBinding to harvesterhci.io:csi-driver.
+  # ClusterRoleBindings are cluster-scoped, so namespace deletion will not
+  # garbage-collect them — we must remove explicitly. Tolerate "not found".
+  kubectl delete clusterrolebinding "${sa_name}-csi-driver" 2>/dev/null \
+    && log "  [ns] deleted clusterrolebinding ${sa_name}-csi-driver" || true
 }
 
 # ── Cluster watch handlers ─────────────────────────────────────────────────────
@@ -587,12 +599,12 @@ kubectl get namespaces -o json | jq -r '
   [[ "$role" == "infrastructure" ]] && continue
   sa_name="harvester-cloud-provider-${ns}"
   if kubectl get secret "${sa_name}-token" -n "$ns" &>/dev/null; then
-    # Cloud-provider credentials already exist. Always re-run ensure_rwx_bindings
-    # — idempotent, and the only way to backfill namespaces provisioned before
-    # this feature was added. On failure, skip marking as processed so the
-    # watch loop retries on the next event.
-    if ! ensure_rwx_bindings "$ns"; then
-      log "  WARN: RWX rolebinding backfill failed for ${ns} — will retry on next watch event"
+    # Cloud-provider credentials already exist. Always re-run the CSI driver
+    # ClusterRoleBinding ensure — idempotent, and the only way to backfill
+    # namespaces provisioned before this feature was added. On failure, skip
+    # marking as processed so the watch loop retries on the next event.
+    if ! ensure_csi_clusterrolebinding "$ns"; then
+      log "  WARN: CSI ClusterRoleBinding backfill failed for ${ns} — will retry on next watch event"
       continue
     fi
 
