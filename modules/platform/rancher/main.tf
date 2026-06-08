@@ -141,21 +141,6 @@ resource "harvester_cloudinit_secret" "cloudinit" {
     tls_key_b64        = var.tls_source == "secret" ? base64encode(var.tls_key) : ""
     rke2_cluster_token = random_password.rke2_token.result
     primary_dns        = var.primary_dns
-    # Pod IP discovery (masquerade) / ConfigMap join coordination (bridge+MetalLB):
-    # both paths use the Harvester Kubernetes API with the embedded kubeconfig creds.
-    harvester_api_url   = local.harvester_api_url
-    harvester_ca_b64    = local.harvester_ca_b64
-    harvester_cert_b64  = local.harvester_cert_b64
-    harvester_key_b64   = local.harvester_key_b64
-    harvester_namespace = var.harvester_namespace
-    # MetalLB: when use_metallb = true, MetalLB is installed on node 0 and the
-    # VIP (ippool_start) is announced via L2 on the VM VLAN instead of using
-    # the Harvester LB controller (which cannot reach bridge-mode VM backends
-    # without inter-VLAN routing from Harvester host nodes to the guest VLAN).
-    use_metallb     = var.use_metallb
-    metallb_version = var.metallb_version
-    metallb_ip      = var.ippool_start
-    vm_name         = var.vm_name
   })
 }
 

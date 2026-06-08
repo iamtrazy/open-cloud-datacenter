@@ -19,8 +19,6 @@ bootcmd:
 packages:
   - qemu-guest-agent
   - curl
-  - avahi-daemon
-  - avahi-utils
 %{~ if tls_source == "secret" }
 
 write_files:
@@ -54,16 +52,15 @@ runcmd:
     RKCFG
 %{~ else }
 
-      # Discover node-0's IP via mDNS — avahi-daemon on node-0 advertises
-      # its hostname (${vm_name}-0.local) on the local VLAN automatically.
-      JOIN_IP=""
-      until JOIN_IP=$(avahi-resolve-host-name -4 ${vm_name}-0.local 2>/dev/null | awk '{print $2}') && [ -n "$JOIN_IP" ]; do
-        sleep 5
+      # Wait for the LB VIP (${lb_ip}) to accept supervisor connections on port 9345.
+      # In masquerade mode the Harvester LB routes this to whichever node is up.
+      until timeout 5 bash -c "</dev/tcp/${lb_ip}/9345" 2>/dev/null; do
+        sleep 15
       done
 
-      cat > /etc/rancher/rke2/config.yaml <<RKCFG
+      cat > /etc/rancher/rke2/config.yaml <<'RKCFG'
       token: ${rke2_cluster_token}
-      server: https://$JOIN_IP:9345
+      server: https://${lb_ip}:9345
       tls-san:
         - ${lb_ip}
     RKCFG
@@ -84,58 +81,6 @@ runcmd:
       until [ "$(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready')" -ge "${node_count}" ]; do
         sleep 15
       done
-%{~ if use_metallb }
-
-      kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/${metallb_version}/config/manifests/metallb-native.yaml
-      kubectl -n metallb-system rollout status deployment/controller --timeout=300s
-      sleep 15
-
-      kubectl apply -f - <<'METALLB'
-      apiVersion: metallb.io/v1beta1
-      kind: IPAddressPool
-      metadata:
-        name: rancher-pool
-        namespace: metallb-system
-      spec:
-        addresses:
-          - ${metallb_ip}/32
-    METALLB
-
-      kubectl apply -f - <<'L2ADV'
-      apiVersion: metallb.io/v1beta1
-      kind: L2Advertisement
-      metadata:
-        name: rancher-l2
-        namespace: metallb-system
-      spec:
-        ipAddressPools:
-          - rancher-pool
-    L2ADV
-
-      until kubectl -n kube-system get ds rke2-ingress-nginx-controller &>/dev/null; do sleep 5; done
-      kubectl -n kube-system rollout status daemonset/rke2-ingress-nginx-controller --timeout=300s
-
-      kubectl apply -f - <<'INGRESSLB'
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: rke2-ingress-lb
-        namespace: kube-system
-        annotations:
-          metallb.universe.tf/loadBalancerIPs: ${metallb_ip}
-      spec:
-        type: LoadBalancer
-        selector:
-          app.kubernetes.io/name: rke2-ingress-nginx
-        ports:
-          - name: http
-            port: 80
-            targetPort: 80
-          - name: https
-            port: 443
-            targetPort: 443
-    INGRESSLB
-%{~ endif }
 
       kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.yaml
       kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=600s
