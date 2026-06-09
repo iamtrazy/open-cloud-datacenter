@@ -5,10 +5,6 @@ terraform {
       source  = "harvester/harvester"
       version = "~> 1.7"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 2.30"
@@ -21,11 +17,13 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.0"
-    }
   }
+}
+
+# ── Cluster join token ────────────────────────────────────────────────────────
+resource "random_password" "rke2_token" {
+  length  = 64
+  special = false
 }
 
 # ── Namespace ─────────────────────────────────────────────────────────────────
@@ -58,17 +56,24 @@ resource "harvester_image" "vm_image" {
   ]
 }
 
+# ── Bridge network ────────────────────────────────────────────────────────────
+resource "harvester_network" "bridge" {
+  count                = var.create_bridge_network ? 1 : 0
+  name                 = var.network_name
+  namespace            = var.harvester_namespace
+  vlan_id              = var.cluster_vlan_id
+  cluster_network_name = var.cluster_network_name
+  depends_on           = [kubernetes_namespace.ns]
+}
+
+# ── Flatten machine_pools → per-VM map ───────────────────────────────────────
 locals {
   image_id = var.image_url != "" ? harvester_image.vm_image[0].id : var.ubuntu_image_id
 
-  # Flatten machine_pools into a map keyed by "<pool-name>-<index>".
-  # The very first entry (pools[0], index 0) is the bootstrap node.
   all_vms = flatten([
     for pool_idx, pool in var.machine_pools : [
       for vm_idx in range(pool.quantity) : {
         key          = "${pool.name}-${vm_idx}"
-        pool_idx     = pool_idx
-        vm_idx       = vm_idx
         pool         = pool
         ip_address   = pool.ip_addresses[vm_idx]
         is_bootstrap = pool_idx == 0 && vm_idx == 0
@@ -77,50 +82,175 @@ locals {
     ]
   ])
 
-  vms          = { for vm in local.all_vms : vm.key => vm }
-  bootstrap_ip = [for vm in local.all_vms : vm.ip_address if vm.is_bootstrap][0]
+  vms               = { for vm in local.all_vms : vm.key => vm }
+  bootstrap_ip      = [for vm in local.all_vms : vm.ip_address if vm.is_bootstrap][0]
+  control_plane_ips = sort([for vm in local.all_vms : vm.ip_address if vm.is_server])
 
-  bridge_network_name = (
+  network_name_full = (
     var.create_bridge_network
     ? "${var.harvester_namespace}/${var.network_name}"
     : var.network_name
   )
-}
 
-check "image_source_required" {
-  assert {
-    condition     = var.image_url != "" || var.ubuntu_image_id != ""
-    error_message = "Set either image_url (to download) or ubuntu_image_id (to reuse an existing image)."
+  # ── RKE2 manifests (bootstrap node only) ────────────────────────────────────
+  # Written to /var/lib/rancher/rke2/server/manifests/ via cloud-init.
+  # RKE2's built-in manifest controller applies these with automatic retries:
+  #   - MetalLB CRs retry until the HelmChart installs the CRDs (~2 min)
+  #   - rancher TLS secret retries until cattle-system namespace exists
+
+  manifest_metallb_ns = yamlencode({
+    apiVersion = "v1"
+    kind       = "Namespace"
+    metadata = {
+      name = "metallb-system"
+      labels = {
+        "pod-security.kubernetes.io/enforce" = "privileged"
+        "pod-security.kubernetes.io/audit"   = "privileged"
+        "pod-security.kubernetes.io/warn"    = "privileged"
+      }
+    }
+  })
+
+  manifest_metallb_helmchart = yamlencode({
+    apiVersion = "helm.cattle.io/v1"
+    kind       = "HelmChart"
+    metadata = {
+      name      = "metallb"
+      namespace = "kube-system"
+    }
+    spec = {
+      repo            = "https://metallb.github.io/metallb"
+      chart           = "metallb"
+      version         = var.metallb_version
+      targetNamespace = "metallb-system"
+      createNamespace = false
+    }
+  })
+
+  manifest_metallb_config = join("\n---\n", [
+    yamlencode({
+      apiVersion = "metallb.io/v1beta1"
+      kind       = "IPAddressPool"
+      metadata   = { name = "kube-api-pool", namespace = "metallb-system" }
+      spec = {
+        addresses = ["${var.metallb_api_vip}/32"]
+        serviceAllocation = {
+          priority   = 100
+          namespaces = ["default"]
+        }
+      }
+    }),
+    yamlencode({
+      apiVersion = "metallb.io/v1beta1"
+      kind       = "IPAddressPool"
+      metadata   = { name = "ingress-pool", namespace = "metallb-system" }
+      spec       = { addresses = ["${var.metallb_ingress_vip}/32"] }
+    }),
+    yamlencode({
+      apiVersion = "metallb.io/v1beta1"
+      kind       = "L2Advertisement"
+      metadata   = { name = "l2-adv", namespace = "metallb-system" }
+      spec       = { ipAddressPools = ["kube-api-pool", "ingress-pool"] }
+    }),
+  ])
+
+  manifest_network_services = join("\n---\n", [
+    yamlencode({
+      apiVersion = "v1"
+      kind       = "Service"
+      metadata = {
+        name      = "kubernetes-vip"
+        namespace = "default"
+        annotations = { "metallb.io/loadBalancerIPs" = var.metallb_api_vip }
+      }
+      spec = {
+        type = "LoadBalancer"
+        ports = [
+          { name = "k8s-api", port = 6443, targetPort = 6443, protocol = "TCP" },
+          { name = "rke2-api", port = 9345, targetPort = 9345, protocol = "TCP" },
+        ]
+      }
+    }),
+    yamlencode({
+      apiVersion = "v1"
+      kind       = "Endpoints"
+      metadata   = { name = "kubernetes-vip", namespace = "default" }
+      subsets = [{
+        addresses = [for ip in local.control_plane_ips : { ip = ip }]
+        ports = [
+          { name = "k8s-api", port = 6443, protocol = "TCP" },
+          { name = "rke2-api", port = 9345, protocol = "TCP" },
+        ]
+      }]
+    }),
+    yamlencode({
+      apiVersion = "v1"
+      kind       = "Service"
+      metadata = {
+        name      = "rke2-ingress-lb"
+        namespace = "kube-system"
+        annotations = { "metallb.io/loadBalancerIPs" = var.metallb_ingress_vip }
+      }
+      spec = {
+        type     = "LoadBalancer"
+        selector = { "app.kubernetes.io/name" = "rke2-ingress-nginx" }
+        ports = [
+          { name = "http", port = 80, targetPort = 80, protocol = "TCP" },
+          { name = "https", port = 443, targetPort = 443, protocol = "TCP" },
+        ]
+      }
+    }),
+  ])
+
+  manifest_rancher_tls = var.tls_source == "secret" ? yamlencode({
+    apiVersion = "v1"
+    kind       = "Secret"
+    metadata   = { name = "tls-rancher-ingress", namespace = "cattle-system" }
+    type       = "kubernetes.io/tls"
+    data = {
+      "tls.crt" = base64encode(var.tls_cert)
+      "tls.key" = base64encode(var.tls_key)
+    }
+  }) : ""
+
+  # ── Per-VM rancherd configs ──────────────────────────────────────────────────
+  rancherd_configs = {
+    for key, vm in local.vms : key => yamlencode(
+      vm.is_bootstrap
+      ? {
+          role              = "cluster-init"
+          kubernetesVersion = var.rke2_version
+          rancherVersion    = var.rancher_version
+          token             = random_password.rke2_token.result
+          tlsSans           = var.tls_san_extra
+          extraConfig = {
+            disable   = ["servicelb"]
+            "node-ip" = vm.ip_address
+          }
+          rancherValues = {
+            hostname          = var.rancher_hostname
+            bootstrapPassword = var.bootstrap_password
+            replicas          = var.rancher_replicas
+            hostPort          = 8443
+            ingress = {
+              enabled = true
+              tls     = { source = var.tls_source }
+            }
+          }
+        }
+      : (vm.is_server ? {
+          role        = "server"
+          server      = "https://${local.bootstrap_ip}:8443"
+          token       = random_password.rke2_token.result
+          extraConfig = { disable = ["servicelb"], "node-ip" = vm.ip_address }
+        } : {
+          role        = "agent"
+          server      = "https://${local.bootstrap_ip}:8443"
+          token       = random_password.rke2_token.result
+          extraConfig = { "node-ip" = vm.ip_address }
+        })
+    )
   }
-}
-
-# ── RKE2 cluster token ────────────────────────────────────────────────────────
-resource "random_password" "rke2_token" {
-  length  = 64
-  special = false
-}
-
-# ── SSH key pair ──────────────────────────────────────────────────────────────
-resource "tls_private_key" "bootstrap_key" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
-resource "harvester_ssh_key" "bootstrap_key" {
-  name       = "${var.vm_name_prefix}-ssh-key"
-  namespace  = var.harvester_namespace
-  public_key = tls_private_key.bootstrap_key.public_key_openssh
-  depends_on = [kubernetes_namespace.ns]
-}
-
-# ── Bridge network (optional) ─────────────────────────────────────────────────
-resource "harvester_network" "bridge" {
-  count                = var.create_bridge_network ? 1 : 0
-  name                 = var.network_name
-  namespace            = var.harvester_namespace
-  vlan_id              = var.cluster_vlan_id
-  cluster_network_name = var.cluster_network_name
-  depends_on           = [kubernetes_namespace.ns]
 }
 
 # ── Per-VM cloud-init secrets ─────────────────────────────────────────────────
@@ -131,20 +261,26 @@ resource "harvester_cloudinit_secret" "cloudinit" {
   depends_on = [kubernetes_namespace.ns]
 
   user_data = templatefile("${path.module}/templates/user-data.yaml.tpl", {
-    password          = var.vm_password
-    ssh_public_key    = tls_private_key.bootstrap_key.public_key_openssh
-    primary_dns       = var.primary_dns
-    rke2_version      = var.rke2_version
-    rke2_token        = random_password.rke2_token.result
-    is_bootstrap      = each.value.is_bootstrap
-    is_server         = each.value.is_server
-    node_ip           = each.value.ip_address
-    subnet_prefix     = each.value.pool.subnet_prefix
-    gateway           = each.value.pool.gateway
-    dns               = var.primary_dns != "" ? var.primary_dns : "8.8.8.8"
-    bootstrap_ip      = local.bootstrap_ip
-    disable_servicelb = var.disable_servicelb
-    tls_san_extra     = var.tls_san_extra
+    password     = var.vm_password
+    primary_dns  = var.primary_dns
+    is_bootstrap = each.value.is_bootstrap
+    bootstrap_ip = local.bootstrap_ip
+    tls_source   = var.tls_source
+
+    rancherd_config = local.rancherd_configs[each.key]
+
+    manifest_metallb_ns        = each.value.is_bootstrap ? local.manifest_metallb_ns : ""
+    manifest_metallb_helmchart = each.value.is_bootstrap ? local.manifest_metallb_helmchart : ""
+    manifest_metallb_config    = each.value.is_bootstrap ? local.manifest_metallb_config : ""
+    manifest_network_services  = each.value.is_bootstrap ? local.manifest_network_services : ""
+    manifest_rancher_tls       = each.value.is_bootstrap ? local.manifest_rancher_tls : ""
+  })
+
+  network_data = templatefile("${path.module}/templates/network-data.yaml.tpl", {
+    node_ip       = each.value.ip_address
+    subnet_prefix = each.value.pool.subnet_prefix
+    gateway       = each.value.pool.gateway
+    dns           = var.primary_dns != "" ? var.primary_dns : "8.8.8.8"
   })
 }
 
@@ -154,24 +290,17 @@ resource "harvester_virtualmachine" "vm" {
   name                 = "${var.vm_name_prefix}-${each.key}"
   namespace            = var.harvester_namespace
   restart_after_update = true
+  depends_on           = [harvester_network.bridge]
 
-  depends_on = [
-    harvester_network.bridge,
-    null_resource.storage_network,
-  ]
-
-  cpu    = each.value.pool.cpu_count
-  memory = each.value.pool.memory_size
-
+  cpu          = each.value.pool.cpu_count
+  memory       = each.value.pool.memory_size
   run_strategy = "RerunOnFailure"
   machine_type = "q35"
-
-  ssh_keys = [harvester_ssh_key.bootstrap_key.id]
 
   network_interface {
     name         = "default"
     type         = "bridge"
-    network_name = local.bridge_network_name
+    network_name = local.network_name_full
   }
 
   disk {
@@ -181,101 +310,22 @@ resource "harvester_virtualmachine" "vm" {
     bus         = "virtio"
     boot_order  = 1
     image       = local.image_id
-    auto_delete = var.vm_disk_auto_delete
+    auto_delete = true
   }
 
-  dynamic "input" {
-    for_each = var.enable_usb_tablet ? [1] : []
-    content {
-      name = "tablet"
-      type = "tablet"
-      bus  = "usb"
-    }
+  input {
+    name = "tablet"
+    type = "tablet"
+    bus  = "usb"
   }
 
   cloudinit {
-    user_data_secret_name = harvester_cloudinit_secret.cloudinit[each.key].name
+    user_data_secret_name    = harvester_cloudinit_secret.cloudinit[each.key].name
+    network_data_secret_name = harvester_cloudinit_secret.cloudinit[each.key].name
   }
-}
-
-# ── SSH private key (written to disk so the null_resource can use it) ─────────
-resource "local_sensitive_file" "ssh_private_key" {
-  content         = tls_private_key.bootstrap_key.private_key_pem
-  filename        = "${dirname(var.kubeconfig_output_path)}/${var.vm_name_prefix}.pem"
-  file_permission = "0600"
-}
-
-# ── Extract kubeconfig from bootstrap node ───────────────────────────────────
-# Waits for the bootstrap VM to be SSHable and for RKE2 to finish initializing,
-# then copies /etc/rancher/rke2/rke2.yaml with 127.0.0.1 replaced by the
-# bootstrap IP so downstream consumers can connect from outside the VM.
-resource "null_resource" "kubeconfig" {
-  triggers = {
-    bootstrap_vm_id = harvester_virtualmachine.vm["${var.machine_pools[0].name}-0"].id
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["bash", "-c"]
-    command     = <<-EOT
-      KEY="${local_sensitive_file.ssh_private_key.filename}"
-      HOST="${local.bootstrap_ip}"
-      OUT="${var.kubeconfig_output_path}"
-
-      echo "Waiting for SSH on $HOST..."
-      until ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-          ubuntu@$HOST exit 2>/dev/null; do
-        sleep 20
-      done
-
-      echo "Waiting for RKE2 kubeconfig on $HOST..."
-      until ssh -i "$KEY" -o StrictHostKeyChecking=no ubuntu@$HOST \
-          "sudo test -f /etc/rancher/rke2/rke2.yaml" 2>/dev/null; do
-        sleep 30
-      done
-
-      # Give the API server a moment to be fully ready after the file appears.
-      sleep 15
-
-      echo "Copying kubeconfig..."
-      ssh -i "$KEY" -o StrictHostKeyChecking=no ubuntu@$HOST \
-          "sudo cat /etc/rancher/rke2/rke2.yaml" \
-        | sed "s/127\.0\.0\.1/$HOST/g" > "$OUT"
-      echo "Kubeconfig written to $OUT"
-    EOT
-  }
-
-  depends_on = [
-    harvester_virtualmachine.vm,
-    local_sensitive_file.ssh_private_key,
-  ]
 }
 
 # ── Storage class (optional) ──────────────────────────────────────────────────
-resource "kubernetes_storage_class_v1" "default" {
-  count      = var.manage_storage_class ? 1 : 0
-  depends_on = [kubernetes_annotations.harvester_longhorn_not_default]
-
-  metadata {
-    name = var.storage_class_name
-    annotations = {
-      "storageclass.kubernetes.io/is-default-class" = "true"
-    }
-  }
-
-  storage_provisioner    = "driver.longhorn.io"
-  allow_volume_expansion = true
-  reclaim_policy         = "Delete"
-  volume_binding_mode    = "Immediate"
-
-  parameters = {
-    numberOfReplicas    = tostring(var.storage_class_replicas)
-    staleReplicaTimeout = "30"
-    fromBackup          = ""
-    fsType              = "ext4"
-    migratable          = "true"
-  }
-}
-
 resource "kubernetes_annotations" "harvester_longhorn_not_default" {
   count       = var.manage_storage_class ? 1 : 0
   api_version = "storage.k8s.io/v1"
@@ -287,17 +337,38 @@ resource "kubernetes_annotations" "harvester_longhorn_not_default" {
   force = true
 }
 
+resource "kubernetes_storage_class_v1" "default" {
+  count      = var.manage_storage_class ? 1 : 0
+  depends_on = [kubernetes_annotations.harvester_longhorn_not_default]
+
+  metadata {
+    name = var.storage_class_name
+    annotations = {
+      "storageclass.kubernetes.io/is-default-class" = "true"
+    }
+  }
+  storage_provisioner    = "driver.longhorn.io"
+  allow_volume_expansion = true
+  reclaim_policy         = "Delete"
+  volume_binding_mode    = "Immediate"
+  parameters = {
+    numberOfReplicas    = tostring(var.storage_class_replicas)
+    staleReplicaTimeout = "30"
+    fromBackup          = ""
+    fsType              = "ext4"
+    migratable          = "true"
+  }
+}
+
 resource "kubernetes_storage_class_v1" "longhorn_rwx" {
   count      = var.manage_storage_class ? 1 : 0
   depends_on = [kubernetes_annotations.harvester_longhorn_not_default]
 
   metadata { name = "longhorn-rwx" }
-
   storage_provisioner    = "driver.longhorn.io"
   allow_volume_expansion = true
   reclaim_policy         = "Delete"
   volume_binding_mode    = "Immediate"
-
   parameters = {
     numberOfReplicas    = "1"
     staleReplicaTimeout = "2880"

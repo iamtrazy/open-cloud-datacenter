@@ -1,17 +1,39 @@
 variable "vm_name_prefix" {
   type        = string
-  description = "Name prefix applied to every VM. Each VM is named <prefix>-<pool>-<index>."
+  description = "Name prefix for all VMs. Each VM is named <prefix>-<pool-name>-<index>."
 }
 
 variable "harvester_namespace" {
   type        = string
-  description = "Harvester namespace for all resources (VMs, secrets, network)."
+  description = "Harvester namespace for all resources."
   default     = "default"
+}
+
+variable "machine_pools" {
+  description = <<-EOT
+    List of machine pool definitions. Each pool creates <quantity> identical VMs.
+    The very first VM of the very first pool is the bootstrap node (cluster-init).
+    All other control_plane/etcd VMs join as RKE2 servers; pure worker pools join
+    as RKE2 agents. ip_addresses must have exactly <quantity> entries.
+  EOT
+  type = list(object({
+    name          = string
+    quantity      = number
+    cpu_count     = number
+    memory_size   = string
+    disk_size     = string
+    control_plane = bool
+    etcd          = bool
+    worker        = bool
+    ip_addresses  = list(string)
+    gateway       = string
+    subnet_prefix = number
+  }))
 }
 
 variable "image_url" {
   type        = string
-  description = "URL of the OS image to download and register. Leave empty if ubuntu_image_id is set."
+  description = "URL of the OS image to download. Leave empty if ubuntu_image_id is set."
   default     = ""
 }
 
@@ -22,161 +44,162 @@ variable "ubuntu_image_id" {
 }
 
 variable "image_name" {
-  type        = string
-  description = "Name for the registered Harvester image resource."
-  default     = "ubuntu-2204-lts"
+  type    = string
+  default = "ubuntu-2204-lts"
 }
 
 variable "image_display_name" {
-  type        = string
-  description = "Display name shown in the Harvester UI for the image."
-  default     = "Ubuntu 22.04 LTS"
-}
-
-variable "machine_pools" {
-  description = <<-EOT
-    List of machine pool definitions. Each pool creates <quantity> identical VMs.
-    The very first VM of the very first pool becomes the cluster bootstrap node
-    (cluster-init: true). All other control-plane/etcd VMs join as servers; pools
-    with control_plane=false and etcd=false join as RKE2 agents (worker-only).
-    ip_addresses must contain exactly <quantity> entries.
-  EOT
-  type = list(object({
-    name          = string
-    quantity      = number
-    cpu_count     = number
-    memory_size   = string # e.g. "8Gi"
-    disk_size     = string # e.g. "60Gi"
-    control_plane = bool
-    etcd          = bool
-    worker        = bool
-    ip_addresses  = list(string) # one per VM in the pool
-    gateway       = string
-    subnet_prefix = number # CIDR prefix length, e.g. 25
-  }))
+  type    = string
+  default = "Ubuntu 22.04 LTS"
 }
 
 variable "network_name" {
   type        = string
-  description = "Bridge NetworkAttachmentDefinition name. Short name when create_bridge_network=true; full <namespace>/<name> when false."
+  description = "Bridge NAD name. Short name when create_bridge_network=true; full <ns>/<name> when false."
 }
 
 variable "create_bridge_network" {
-  type        = bool
-  description = "Create the NAD before VMs start. Set false when the NAD already exists."
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "cluster_network_name" {
-  type        = string
-  description = "Harvester cluster network the VLAN attaches to (e.g. 'vm-network')."
-  default     = "mgmt"
+  type    = string
+  default = "mgmt"
 }
 
 variable "cluster_vlan_id" {
-  type        = number
-  description = "VLAN tag ID for the bridge network."
-  default     = 100
+  type    = number
+  default = 100
 }
 
 variable "rke2_version" {
   type        = string
-  description = "RKE2 release to install, e.g. 'v1.34.7+rke2r1'."
+  description = "RKE2 version string, e.g. v1.34.7+rke2r1. Passed to rancherd kubernetesVersion."
   default     = "v1.34.7+rke2r1"
-}
-
-variable "disable_servicelb" {
-  type        = bool
-  description = "Disable RKE2's built-in ServiceLB (kube-vip). Required when using MetalLB."
-  default     = true
 }
 
 variable "tls_san_extra" {
   type        = list(string)
-  description = "Additional IPs or hostnames to include in the RKE2 kube-apiserver TLS SAN list (e.g. a future MetalLB VIP)."
+  description = "Additional IPs/hostnames for the kube-apiserver TLS SAN. Include the MetalLB API VIP."
   default     = []
 }
 
 variable "primary_dns" {
-  type        = string
-  description = "Primary DNS server IP configured via systemd-resolved before any package downloads."
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "vm_password" {
-  type        = string
-  description = "Password for the ubuntu user on every VM."
-  sensitive   = true
-}
-
-variable "vm_disk_auto_delete" {
-  type        = bool
-  description = "Delete the root disk when the VM is deleted."
-  default     = true
-}
-
-variable "enable_usb_tablet" {
-  type        = bool
-  description = "Attach a USB tablet input device (fixes cursor behaviour in the Harvester console)."
-  default     = true
+  type      = string
+  sensitive = true
 }
 
 variable "harvester_kubeconfig_path" {
   type        = string
-  description = "Path to the Harvester kubeconfig, used for storage class management and state extraction."
+  description = "Path to the Harvester kubeconfig, used for storage class management."
   default     = ""
 }
 
 variable "manage_storage_class" {
-  type        = bool
-  description = "Create a 2-replica Longhorn StorageClass and set it as the cluster default."
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "storage_class_name" {
-  type        = string
-  description = "Name of the custom Longhorn StorageClass created when manage_storage_class=true."
-  default     = "harvester-longhorn-2r"
+  type    = string
+  default = "harvester-longhorn-2r"
 }
 
 variable "storage_class_replicas" {
-  type        = number
-  description = "Longhorn replica count for the custom StorageClass."
-  default     = 2
-}
-
-variable "kubeconfig_output_path" {
-  type        = string
-  description = "Local file path where the extracted RKE2 kubeconfig is written after the cluster is ready."
-  default     = "rke2.kubeconfig"
+  type    = number
+  default = 2
 }
 
 variable "manage_storage_network" {
-  type        = bool
-  description = "Patch the Harvester storage-network setting for dedicated Longhorn replication traffic."
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "storage_network_vlan" {
-  type        = number
-  description = "VLAN ID for the storage network."
-  default     = 0
+  type    = number
+  default = 0
 }
 
 variable "storage_network_cluster_network" {
-  type        = string
-  description = "Harvester cluster network name for storage traffic."
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "storage_network_range" {
-  type        = string
-  description = "IP CIDR range for storage NICs."
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "storage_network_exclude_ranges" {
-  type        = list(string)
-  description = "CIDR blocks to exclude from the storage range."
-  default     = []
+  type    = list(string)
+  default = []
+}
+
+# ── rancherd / Rancher ────────────────────────────────────────────────────────
+
+variable "rancher_version" {
+  type        = string
+  description = "Rancher version to install, e.g. 2.14.0. Passed to rancherd rancherVersion."
+  default     = "stable"
+}
+
+variable "rancher_hostname" {
+  type        = string
+  description = "FQDN for the Rancher UI (e.g. rancher-us-prod.iaas.sys.wso2.com)."
+}
+
+variable "rancher_replicas" {
+  type        = number
+  description = "Number of Rancher pod replicas. Should match the number of control-plane nodes."
+  default     = 3
+}
+
+variable "bootstrap_password" {
+  type        = string
+  sensitive   = true
+  description = "Initial Rancher admin password."
+}
+
+variable "tls_source" {
+  type        = string
+  description = "'secret' for BYO cert, 'rancher' for self-signed. Passed to Rancher ingress.tls.source."
+  default     = "rancher"
+}
+
+variable "tls_cert" {
+  type        = string
+  sensitive   = true
+  description = "PEM-encoded TLS certificate chain. Required when tls_source = 'secret'."
+  default     = ""
+}
+
+variable "tls_key" {
+  type        = string
+  sensitive   = true
+  description = "PEM-encoded TLS private key. Required when tls_source = 'secret'."
+  default     = ""
+}
+
+# ── MetalLB ───────────────────────────────────────────────────────────────────
+
+variable "metallb_version" {
+  type        = string
+  description = "MetalLB Helm chart version, e.g. 0.14.9."
+  default     = "0.14.9"
+}
+
+variable "metallb_api_vip" {
+  type        = string
+  description = "MetalLB VIP for the kube-apiserver HA Service (ports 6443 + 9345). Must also be in tls_san_extra."
+}
+
+variable "metallb_ingress_vip" {
+  type        = string
+  description = "MetalLB VIP for RKE2 ingress-nginx (ports 80/443). DNS A record for rancher_hostname must point here."
 }
